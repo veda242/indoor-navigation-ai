@@ -33,8 +33,13 @@ class NavigationDecisionEngine:
         self.total_obstacles_encountered = 0
         self.safe_passages_found = 0
     
-    def make_navigation_decision(self, detected_object, depth_map, frame):
-        """Make comprehensive navigation decision"""
+    def make_navigation_decision(self, detected_objects, depth_map, frame):
+        """Make comprehensive navigation decision.
+
+        detected_objects is every obstacle YOLO found in this frame, not just
+        one - we rank them all by actual danger (distance + object type) and
+        act on the most urgent, but still record every one of them so a
+        nearby-but-lower-priority obstacle never gets silently dropped."""
         decision = {
             'action': 'continue',
             'confidence': 0,
@@ -42,47 +47,53 @@ class NavigationDecisionEngine:
             'guidance': {},
             'map_update': False
         }
-        
-        if detected_object:
-            label, x1, y1, x2, y2 = detected_object
-            
-            # Analyze the detected obstacle
-            depth_value = self._get_depth_value(depth_map, x1, y1, x2, y2)
-            distance = self._classify_distance(depth_value)
-            
-            # Track obstacle in environment
-            self.environment_mapper.add_obstacle(x1, y1, x2, y2, label, distance, depth_value)
+
+        if detected_objects:
+            # Analyze every obstacle and track it in the environment map
+            ranked = []
+            for label, x1, y1, x2, y2 in detected_objects:
+                depth_value = self._get_depth_value(depth_map, x1, y1, x2, y2)
+                distance = self._classify_distance(depth_value)
+                danger_level = self.obstacle_analyzer.get_danger_level(label, distance)
+                self.obstacle_analyzer.track_obstacle_frequency(label)
+                self.environment_mapper.add_obstacle(x1, y1, x2, y2, label, distance, depth_value)
+                ranked.append((danger_level, depth_value, distance, (label, x1, y1, x2, y2)))
+
             decision['map_update'] = True
-            
-            # Get obstacle analysis
+
+            # Act on the single most urgent obstacle: highest danger first,
+            # then closest, so a near chair always wins over a far-off person
+            ranked.sort(key=lambda r: (r[0], r[1]), reverse=True)
+            danger_level, depth_value, distance, (label, x1, y1, x2, y2) = ranked[0]
+
             obstacle_info = self.obstacle_analyzer.classify_obstacle(label)
-            danger_level = self.obstacle_analyzer.get_danger_level(label, distance)
-            frequency = self.obstacle_analyzer.track_obstacle_frequency(label)
-            
+            frequency = self.obstacle_analyzer.obstacle_history.get(label, 0)
+
             # Get position in frame
             center_x = (x1 + x2) // 2
-            
+
             # Generate comprehensive guidance
             guidance = self._generate_guidance(
-                label, distance, center_x, depth_value, 
+                label, distance, center_x, depth_value,
                 obstacle_info, danger_level
             )
-            
+
             decision['guidance'] = guidance
             decision['obstacle_info'] = {
                 'label': label,
                 'position': (x1, y1, x2, y2),
                 'distance': distance,
                 'danger_level': danger_level,
-                'frequency': frequency
+                'frequency': frequency,
+                'other_objects_count': len(detected_objects) - 1
             }
-            
+
             # Determine action
             decision = self._determine_action(
                 label, distance, center_x, danger_level, decision
             )
-            
-            self.total_obstacles_encountered += 1
+
+            self.total_obstacles_encountered += len(detected_objects)
             self.consecutive_obstacles += 1
         else:
             # No obstacle detected - path is clear

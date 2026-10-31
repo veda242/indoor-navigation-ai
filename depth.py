@@ -3,11 +3,11 @@ import cv2
 
 # Load MiDaS model
 model_type = "MiDaS_small"
-midas = torch.hub.load("intel-isl/MiDaS", model_type)
+midas = torch.hub.load("intel-isl/MiDaS", model_type, trust_repo=True)
 midas.eval()
 
 # Load transforms
-transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
 transform = transforms.small_transform
 
 

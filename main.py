@@ -25,6 +25,8 @@ class IndoorNavigationSystem:
         # Session state
         self.frame_count = 0
         self.is_running = False
+        self.depth_min_ema = None
+        self.depth_max_ema = None
         
         # For visualization
         self.show_visualization = True
@@ -73,10 +75,20 @@ class IndoorNavigationSystem:
             # Get depth map
             depth_map = get_depth_map(frame)
             
-            # Normalize depth
-            min_val = depth_map.min()
-            max_val = depth_map.max()
-            normalized_depth = (depth_map - min_val) / (max_val - min_val + 1e-6)
+            # Normalize depth using a smoothed min/max across frames, so a single
+            # frame's nearest pixel doesn't always get stretched to "very close"
+            # ponytail: relative-depth model has no true distance calibration; this
+            # only reduces frame-to-frame noise, upgrade to a calibrated sensor if
+            # false "very close" triggers persist
+            min_val, max_val = depth_map.min(), depth_map.max()
+            if self.depth_min_ema is None:
+                self.depth_min_ema, self.depth_max_ema = min_val, max_val
+            else:
+                alpha = 0.1
+                self.depth_min_ema = alpha * min_val + (1 - alpha) * self.depth_min_ema
+                self.depth_max_ema = alpha * max_val + (1 - alpha) * self.depth_max_ema
+            normalized_depth = (depth_map - self.depth_min_ema) / (self.depth_max_ema - self.depth_min_ema + 1e-6)
+            normalized_depth = np.clip(normalized_depth, 0, 1)
             
             # Detect objects
             obj = detect_objects(frame)
@@ -111,7 +123,19 @@ class IndoorNavigationSystem:
         
         # Provide voice guidance
         if action == 'stop_immediately':
-            self.voice_system.emergency_stop()
+            obstacle_info = decision.get('obstacle_info', {})
+            x1, y1, x2, y2 = obstacle_info.get('position', (0, 0, 0, 0))
+            center_x = (x1 + x2) // 2
+            if center_x < width // 3:
+                position = "on your left"
+            elif center_x < 2 * width // 3:
+                position = "right in front of you"
+            else:
+                position = "on your right"
+            self.voice_system.emergency_stop(
+                obstacle_label=obstacle_info.get('label'),
+                position=position
+            )
         
         elif obj:
             obstacle_info = decision.get('obstacle_info', {})
@@ -120,7 +144,8 @@ class IndoorNavigationSystem:
                     'object': obstacle_info.get('label'),
                     'distance': obstacle_info.get('distance'),
                     'action': guidance.get('direction', guidance.get('action', 'Be careful')),
-                    'urgency': self._get_urgency(obstacle_info.get('danger_level', 2))
+                    'urgency': self._get_urgency(obstacle_info.get('danger_level', 2)),
+                    'other_objects_count': obstacle_info.get('other_objects_count', 0)
                 }
             )
         else:
@@ -144,30 +169,35 @@ class IndoorNavigationSystem:
         else:
             return 'AWARE'
     
-    def _draw_visualization(self, frame, decision, obj, width, height):
+    def _draw_visualization(self, frame, decision, objects, width, height):
         """Draw visualization on frame"""
-        if obj:
-            label, x1, y1, x2, y2 = obj
-            
-            # Draw bounding box
-            action = decision.get('action')
-            if action == 'stop_immediately':
-                color = (0, 0, 255)  # Red for danger
-            elif action in ['avoid_and_move', 'move_carefully']:
-                color = (0, 165, 255)  # Orange for caution
-            else:
-                color = (0, 255, 0)  # Green for safe
-            
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            
-            # Draw label and distance
+        if objects:
             obstacle_info = decision.get('obstacle_info', {})
-            distance = obstacle_info.get('distance', 'UNKNOWN')
-            danger_level = obstacle_info.get('danger_level', 0)
-            
-            label_text = f"{label} - {distance} (Danger: {danger_level}/5)"
-            cv2.putText(frame, label_text, (x1, y1 - 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            primary_position = obstacle_info.get('position')
+            action = decision.get('action')
+
+            for label, x1, y1, x2, y2 in objects:
+                is_primary = (x1, y1, x2, y2) == primary_position
+                if is_primary and action == 'stop_immediately':
+                    color = (0, 0, 255)  # Red for danger
+                elif is_primary and action in ['avoid_and_move', 'move_carefully']:
+                    color = (0, 165, 255)  # Orange for caution
+                elif is_primary:
+                    color = (0, 255, 0)  # Green for safe
+                else:
+                    color = (200, 200, 0)  # Dim cyan for other, non-primary obstacles
+
+                thickness = 3 if is_primary else 1
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+
+                if is_primary:
+                    distance = obstacle_info.get('distance', 'UNKNOWN')
+                    danger_level = obstacle_info.get('danger_level', 0)
+                    label_text = f"{label} - {distance} (Danger: {danger_level}/5)"
+                else:
+                    label_text = label
+                cv2.putText(frame, label_text, (x1, y1 - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         # Draw action guidance
         guidance = decision.get('guidance', {})

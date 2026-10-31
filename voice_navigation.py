@@ -3,19 +3,34 @@ Enhanced Voice Navigation System
 Provides intelligent voice guidance for navigation
 """
 
-import pyttsx3
 import queue
+import shutil
+import subprocess
 import threading
 from datetime import datetime, timedelta
 
+# macOS's built-in `say` command speaks one message at a time reliably.
+# pyttsx3 (via the macOS NSSpeechSynthesizer driver) is known to cut words
+# off when called repeatedly from a loop/thread, which is unacceptable for
+# an accessibility tool, so we prefer `say` whenever it's available and
+# only fall back to pyttsx3 on other platforms.
+# ponytail: macOS-only fast path; add a Linux (espeak) / Windows (SAPI via
+# pyttsx3) path if this needs to run there too.
+_SAY_BIN = shutil.which("say")
+if not _SAY_BIN:
+    import pyttsx3
+
+
 class VoiceNavigationSystem:
     """Intelligent voice guidance system for navigation"""
-    
+
     def __init__(self, rate=150):
-        self.engine = pyttsx3.init()
-        self.engine.setProperty('rate', rate)
-        self.engine.setProperty('volume', 1.0)
-        
+        self.rate = rate
+        self.engine = None if _SAY_BIN else pyttsx3.init()
+        if self.engine:
+            self.engine.setProperty('rate', rate)
+            self.engine.setProperty('volume', 1.0)
+
         # Track voice feedback to avoid repetition
         self.last_feedback = {}
         self.feedback_cooldown = 2  # seconds
@@ -43,22 +58,33 @@ class VoiceNavigationSystem:
             'environment_summary': "I've detected {count} types of obstacles in this area."
         }
     
+    def _speak_blocking(self, message):
+        """Speak a message to completion before returning"""
+        if _SAY_BIN:
+            # words-per-minute rate maps directly to `say -r`
+            subprocess.run([_SAY_BIN, "-r", str(self.rate), message])
+        else:
+            self.engine.say(message)
+            self.engine.runAndWait()
+
     def _process_voice_queue(self):
         """Process voice commands from queue in a separate thread"""
         while True:
             try:
                 message = self.voice_queue.get(timeout=1)
-                self.engine.say(message)
-                self.engine.runAndWait()
+                self._speak_blocking(message)
             except queue.Empty:
                 continue
-    
+
     def say(self, message, priority='normal', wait=False):
         """Queue a voice message"""
         if wait:
-            self.engine.say(message)
-            self.engine.runAndWait()
+            self._speak_blocking(message)
         else:
+            # Drop message if queue is already backed up, to avoid a growing
+            # backlog of stale alerts (e.g. repeated per-frame emergencies)
+            if self.voice_queue.qsize() >= 2:
+                return
             self.voice_queue.put(message)
         
         # Log in history
@@ -84,7 +110,16 @@ class VoiceNavigationSystem:
             message = f"Watch out! {label} ahead at {distance}. Please {action}."
         else:
             message = f"{label} detected. {distance}. {action}."
-        
+
+        # Mention other obstacles in frame so the user knows it isn't just one -
+        # only the most urgent one gets full guidance, but silence about the
+        # rest would be misleading for someone who can't see them
+        other_count = obstacle_info.get('other_objects_count', 0)
+        if other_count == 1:
+            message += " One more object nearby."
+        elif other_count > 1:
+            message += f" {other_count} more objects nearby."
+
         # Check cooldown to avoid repetitive messages
         key = f"{label}_{distance}_{action}"
         now = datetime.now()
@@ -219,9 +254,20 @@ class VoiceNavigationSystem:
         message = messages[len(self.feedback_history) % len(messages)]
         self.say(message, priority='normal')
     
-    def emergency_stop(self):
-        """Emergency stop announcement"""
-        self.say("EMERGENCY STOP! Do not move! Analyze your surroundings!", priority='critical')
+    def emergency_stop(self, obstacle_label=None, position=None):
+        """Emergency stop announcement - always names what's blocking the path
+        and where, since a blind user can't see it to confirm for themselves"""
+        key = 'emergency_stop'
+        now = datetime.now()
+        if key not in self.last_feedback or \
+           (now - self.last_feedback[key]) > timedelta(seconds=self.feedback_cooldown):
+            if obstacle_label:
+                where = f" {position}" if position else ""
+                message = f"STOP! {obstacle_label}{where}, very close. Do not move."
+            else:
+                message = "EMERGENCY STOP! Do not move! Analyze your surroundings!"
+            self.say(message, priority='critical')
+            self.last_feedback[key] = now
     
     def reset(self):
         """Reset voice system"""

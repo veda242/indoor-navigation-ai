@@ -7,23 +7,12 @@ important_classes = [
     "refrigerator", "tv"
 ]
 
-priority = {
-    "person": 3,
-    "chair": 2,
-    "table": 2,
-    "sofa": 1,
-    "bed": 1,
-    "refrigerator": 2,
-    "tv": 1
-}
-
-
 def detect_objects(frame):
+    """Return every detected obstacle, not just one - the caller (which has
+    depth info) decides which is most urgent to act on."""
     results = model(frame)
 
-    best_object = None
-    best_score = 0
-
+    objects = []
     for result in results:
         for box in result.boxes:
             cls_id = int(box.cls[0])
@@ -31,12 +20,6 @@ def detect_objects(frame):
 
             if label in important_classes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                width = x2 - x1
+                objects.append((label, x1, y1, x2, y2))
 
-                score = width * priority.get(label, 1)
-
-                if score > best_score:
-                    best_score = score
-                    best_object = (label, x1, y1, x2, y2)
-
-    return best_object
+    return objects
